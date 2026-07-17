@@ -14,8 +14,12 @@ def generate_launch_description():
     checkpoint = LaunchConfiguration("checkpoint")
     input_topic = LaunchConfiguration("input_topic")
     frame_id = LaunchConfiguration("frame_id")
+    precision = LaunchConfiguration("precision")
+    profile_stages = LaunchConfiguration("profile_stages")
     score_threshold = LaunchConfiguration("score_threshold")
     max_detections = LaunchConfiguration("max_detections")
+    nms_pre_max_size = LaunchConfiguration("nms_pre_max_size")
+    nms_post_max_size = LaunchConfiguration("nms_post_max_size")
 
     inference = ExecuteProcess(
         cmd=[
@@ -32,9 +36,17 @@ def generate_launch_description():
             "-p",
             ["frame_id:=", frame_id],
             "-p",
+            ["precision:=", precision],
+            "-p",
+            ["profile_stages:=", profile_stages],
+            "-p",
             ["score_threshold:=", score_threshold],
             "-p",
             ["max_detections:=", max_detections],
+            "-p",
+            ["nms_pre_max_size:=", nms_pre_max_size],
+            "-p",
+            ["nms_post_max_size:=", nms_post_max_size],
         ],
         output="screen",
         on_exit=Shutdown(reason="PointPillars inference process exited"),
@@ -65,11 +77,14 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("input_topic", default_value="/lidar/points"),
             DeclareLaunchArgument("frame_id", default_value="lidar"),
+            DeclareLaunchArgument("precision", default_value="fp16"),
+            DeclareLaunchArgument("profile_stages", default_value="false"),
             DeclareLaunchArgument("score_threshold", default_value="0.5"),
             DeclareLaunchArgument("max_detections", default_value="200"),
+            DeclareLaunchArgument("nms_pre_max_size", default_value="4096"),
+            DeclareLaunchArgument("nms_post_max_size", default_value="500"),
             DeclareLaunchArgument("rviz", default_value="true"),
             inference,
             rviz,
         ]
     )
-

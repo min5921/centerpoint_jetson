@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import rclpy
 import torch
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -47,8 +48,12 @@ class PointPillarsInference(Node):
         self.declare_parameter("status_topic", "/centerpoint/status")
         self.declare_parameter("frame_id", "lidar")
         self.declare_parameter("device", "cuda:0")
+        self.declare_parameter("precision", "fp16")
+        self.declare_parameter("profile_stages", False)
         self.declare_parameter("score_threshold", 0.5)
         self.declare_parameter("max_detections", 200)
+        self.declare_parameter("nms_pre_max_size", 4096)
+        self.declare_parameter("nms_post_max_size", 500)
         self.declare_parameter("intensity_field", "intensity")
         self.declare_parameter("elongation_field", "elongation")
         self.declare_parameter("normalize_intensity", True)
@@ -56,12 +61,29 @@ class PointPillarsInference(Node):
         self.frame_id = str(self.get_parameter("frame_id").value)
         self.threshold = float(self.get_parameter("score_threshold").value)
         self.max_detections = max(int(self.get_parameter("max_detections").value), 1)
+        self.nms_pre_max_size = max(
+            int(self.get_parameter("nms_pre_max_size").value), 1
+        )
+        self.nms_post_max_size = max(
+            int(self.get_parameter("nms_post_max_size").value), 1
+        )
+        if self.nms_post_max_size > self.nms_pre_max_size:
+            raise ValueError("nms_post_max_size cannot exceed nms_pre_max_size")
         self.intensity_field = str(self.get_parameter("intensity_field").value)
         self.elongation_field = str(self.get_parameter("elongation_field").value)
         self.normalize_intensity = bool(
             self.get_parameter("normalize_intensity").value
         )
         self.device = torch.device(str(self.get_parameter("device").value))
+        self.precision = str(self.get_parameter("precision").value).lower()
+        if self.precision not in {"fp16", "fp32"}:
+            raise ValueError("precision must be either 'fp16' or 'fp32'")
+        if self.precision == "fp16" and self.device.type != "cuda":
+            raise ValueError("fp16 precision requires a CUDA device")
+        self.use_amp = self.precision == "fp16"
+        self.profile_stages = bool(self.get_parameter("profile_stages").value)
+        if self.profile_stages and self.device.type != "cuda":
+            raise ValueError("stage profiling requires a CUDA device")
         self.warned_fields = set()
         self.frames = 0
 
@@ -79,9 +101,8 @@ class PointPillarsInference(Node):
         self.get_logger().info(f"Loading config: {config_path}")
         self.cfg = Config.fromfile(str(config_path))
         self.cfg.test_cfg.score_threshold = self.threshold
-        self.cfg.test_cfg.nms.nms_post_max_size = max(
-            self.max_detections, int(self.cfg.test_cfg.nms.nms_post_max_size)
-        )
+        self.cfg.test_cfg.nms.nms_pre_max_size = self.nms_pre_max_size
+        self.cfg.test_cfg.nms.nms_post_max_size = self.nms_post_max_size
         voxel_cfg = self.cfg.voxel_generator
         max_voxel_num = voxel_cfg.max_voxel_num
         if isinstance(max_voxel_num, (list, tuple)):
@@ -132,7 +153,9 @@ class PointPillarsInference(Node):
         )
         self.get_logger().info(
             f"Ready: input={input_topic}, device={self.device}, "
-            f"threshold={self.threshold:.2f}, max_voxels={self.max_voxels}"
+            f"precision={self.precision}, threshold={self.threshold:.2f}, "
+            f"max_voxels={self.max_voxels}, profile_stages={self.profile_stages}, "
+            f"nms_pre={self.nms_pre_max_size}, nms_post={self.nms_post_max_size}"
         )
 
     def warn_missing_field(self, field_name):
@@ -179,14 +202,19 @@ class PointPillarsInference(Node):
         return np.ascontiguousarray(points[np.isfinite(points).all(axis=1)])
 
     def make_example(self, points):
+        voxel_started = time.perf_counter()
         voxels, coordinates, num_points = self.voxel_generator.generate(
             points, max_voxels=self.max_voxels
         )
         if len(voxels) == 0:
-            return None, 0
+            voxel_ms = (time.perf_counter() - voxel_started) * 1000.0
+            return None, 0, voxel_ms, 0.0
         coordinates = np.pad(
             coordinates, ((0, 0), (1, 0)), mode="constant", constant_values=0
         )
+        voxel_ms = (time.perf_counter() - voxel_started) * 1000.0
+
+        h2d_started = time.perf_counter()
         example = {
             "voxels": torch.from_numpy(voxels).to(self.device),
             "coordinates": torch.from_numpy(coordinates).to(self.device),
@@ -197,7 +225,61 @@ class PointPillarsInference(Node):
             "shape": np.expand_dims(self.voxel_generator.grid_size, axis=0),
             "metadata": [None],
         }
-        return example, len(voxels)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        h2d_ms = (time.perf_counter() - h2d_started) * 1000.0
+        return example, len(voxels), voxel_ms, h2d_ms
+
+    def run_profiled_model(self, example):
+        events = {}
+
+        def run_stage(name, callback):
+            started = torch.cuda.Event(enable_timing=True)
+            finished = torch.cuda.Event(enable_timing=True)
+            started.record()
+            output = callback()
+            finished.record()
+            events[name] = (started, finished)
+            return output
+
+        voxels = example["voxels"]
+        coordinates = example["coordinates"]
+        num_points = example["num_points"]
+        batch_size = len(example["num_voxels"])
+        input_shape = example["shape"][0]
+
+        pillar_features = run_stage(
+            "pfn",
+            lambda: self.model.reader(voxels, num_points, coordinates),
+        )
+        spatial_features = run_stage(
+            "scatter",
+            lambda: self.model.backbone(
+                pillar_features, coordinates, batch_size, input_shape
+            ),
+        )
+        if self.model.with_neck:
+            spatial_features = run_stage(
+                "rpn", lambda: self.model.neck(spatial_features)
+            )
+        predictions, _ = run_stage(
+            "head", lambda: self.model.bbox_head(spatial_features)
+        )
+        results = run_stage(
+            "decode_nms",
+            lambda: self.model.bbox_head.predict(
+                example, predictions, self.model.test_cfg
+            ),
+        )
+
+        torch.cuda.synchronize(self.device)
+        timings = {
+            name: started.elapsed_time(finished)
+            for name, (started, finished) in events.items()
+        }
+        if "rpn" not in timings:
+            timings["rpn"] = 0.0
+        return results[0], timings
 
     def copy_cloud_for_output(self, message):
         output = copy.copy(message)
@@ -268,30 +350,40 @@ class PointPillarsInference(Node):
 
     def on_pointcloud(self, message):
         started = time.perf_counter()
+        cloud_publish_started = time.perf_counter()
         output_cloud = self.copy_cloud_for_output(message)
         self.points_pub.publish(output_cloud)
+        cloud_publish_ms = (time.perf_counter() - cloud_publish_started) * 1000.0
         header = copy.copy(output_cloud.header)
         try:
+            decode_started = time.perf_counter()
             points = self.pointcloud_to_model_input(message)
-            voxel_started = time.perf_counter()
-            example, voxel_count = self.make_example(points)
-            voxel_ms = (time.perf_counter() - voxel_started) * 1000.0
+            decode_ms = (time.perf_counter() - decode_started) * 1000.0
+            example, voxel_count, voxel_ms, h2d_ms = self.make_example(points)
             if example is None:
                 self.detections_pub.publish(self.empty_markers(header))
                 self.publish_status(f"points={len(points)} voxels=0 detections=0")
                 return
 
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
             inference_started = time.perf_counter()
             with torch.inference_mode():
-                result = self.model(example, return_loss=False)[0]
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=self.use_amp,
+                ):
+                    if self.profile_stages:
+                        result, stage_ms = self.run_profiled_model(example)
+                    else:
+                        result = self.model(example, return_loss=False)[0]
+                        stage_ms = {}
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             inference_ms = (time.perf_counter() - inference_started) * 1000.0
             if not rclpy.ok():
                 return
 
+            post_started = time.perf_counter()
             scores = result["scores"].detach().cpu().numpy()
             boxes = result["box3d_lidar"].detach().cpu().numpy()
             labels = result["label_preds"].detach().cpu().numpy()
@@ -300,17 +392,32 @@ class PointPillarsInference(Node):
             if len(scores) > self.max_detections:
                 order = np.argsort(scores)[-self.max_detections :][::-1]
                 scores, boxes, labels = scores[order], boxes[order], labels[order]
+            post_ms = (time.perf_counter() - post_started) * 1000.0
 
-            self.detections_pub.publish(
-                self.result_markers(boxes, scores, labels, header)
-            )
+            markers_started = time.perf_counter()
+            markers = self.result_markers(boxes, scores, labels, header)
+            self.detections_pub.publish(markers)
+            markers_ms = (time.perf_counter() - markers_started) * 1000.0
             self.frames += 1
             total_ms = (time.perf_counter() - started) * 1000.0
             status = (
-                f"frame={self.frames} points={len(points)} voxels={voxel_count} "
+                f"frame={self.frames} precision={self.precision} "
+                f"nms_pre={self.nms_pre_max_size} "
+                f"nms_post={self.nms_post_max_size} "
+                f"points={len(points)} voxels={voxel_count} "
                 f"detections={len(scores)} voxel_ms={voxel_ms:.1f} "
                 f"inference_ms={inference_ms:.1f} total_ms={total_ms:.1f}"
             )
+            if self.profile_stages:
+                status += (
+                    f" cloud_ms={cloud_publish_ms:.1f} decode_ms={decode_ms:.1f} "
+                    f"h2d_ms={h2d_ms:.1f} pfn_ms={stage_ms['pfn']:.1f} "
+                    f"scatter_ms={stage_ms['scatter']:.1f} "
+                    f"rpn_ms={stage_ms['rpn']:.1f} "
+                    f"head_ms={stage_ms['head']:.1f} "
+                    f"decode_nms_ms={stage_ms['decode_nms']:.1f} "
+                    f"post_ms={post_ms:.1f} markers_ms={markers_ms:.1f}"
+                )
             self.publish_status(status)
             if self.frames == 1 or self.frames % 20 == 0:
                 self.get_logger().info(status)
@@ -327,7 +434,7 @@ def main(args=None):
     node = PointPillarsInference()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         try:

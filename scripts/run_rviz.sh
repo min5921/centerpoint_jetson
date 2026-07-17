@@ -48,6 +48,10 @@ export CUDA_HOME=/usr/local/cuda
 exec ros2 launch centerpoint_pointpillars_ros inference.launch.py \
   input_topic:="${INPUT_TOPIC:-/lidar/points}" \
   frame_id:="${FRAME_ID:-lidar}" \
+  precision:="${PRECISION:-fp16}" \
+  profile_stages:="${PROFILE_STAGES:-false}" \
   score_threshold:="${SCORE_THRESHOLD:-0.5}" \
   max_detections:="${MAX_DETECTIONS:-200}" \
+  nms_pre_max_size:="${NMS_PRE_MAX_SIZE:-4096}" \
+  nms_post_max_size:="${NMS_POST_MAX_SIZE:-500}" \
   rviz:="${RVIZ:-true}"
