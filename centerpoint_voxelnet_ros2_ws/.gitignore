@@ -1,0 +1,9 @@
+.cache/
+.venv/
+build/
+install/
+log/
+third_party/*
+!third_party/COLCON_IGNORE
+__pycache__/
+*.pyc

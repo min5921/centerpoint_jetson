@@ -1,0 +1,50 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 5
+    - Class: rviz_default_plugins/PointCloud2
+      Name: LiDAR Points
+      Enabled: true
+      Topic:
+        Value: /voxelnet/points
+      Size (Pixels): 2
+      Style: Points
+      Color Transformer: FlatColor
+      Color: 190; 195; 205
+    - Class: rviz_default_plugins/MarkerArray
+      Name: VoxelNet Detections
+      Enabled: true
+      Topic:
+        Value: /voxelnet/detections
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Waymo Ground Truth
+      Enabled: true
+      Topic:
+        Value: /waymo/ground_truth
+  Global Options:
+    Fixed Frame: vehicle
+    Background Color: 25; 27; 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 85
+      Pitch: 0.75
+      Yaw: 1.57
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+Window Geometry:
+  Width: 1500
+  Height: 900
